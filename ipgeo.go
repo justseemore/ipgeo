@@ -1,33 +1,33 @@
 package ipgeo
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"strings"
-
-	"github.com/lionsoul2014/ip2region/binding/golang/service"
 )
 
-// ErrNotFound 表示库中没有该 IP 的记录。
-var ErrNotFound = errors.New("ipgeo: ip not found in database")
+var (
+	// ErrNotFound 表示库中没有该 IP 的记录。
+	ErrNotFound = errors.New("ipgeo: ip not found in database")
+	// ErrInvalidIP 表示入参不是合法 IP。
+	ErrInvalidIP = errors.New("ipgeo: invalid ip address")
+)
 
-// CachePolicy 是 xdb 的缓存策略。
+// CachePolicy 保留以兼容旧调用签名。
+// 本分支统一走 mmap 全内存查询，三种策略行为等价：
+// 都不再打开常驻文件句柄，也不再需要 searcher 池。
 type CachePolicy int
 
 const (
-	// CacheNone 完全基于文件查询，最省内存，每次查询有一次磁盘 IO。
-	CacheNone CachePolicy = CachePolicy(service.NoCache)
-	// CacheVectorIndex 只缓存 512KiB 向量索引，默认推荐。
-	CacheVectorIndex CachePolicy = CachePolicy(service.VIndexCache)
-	// CacheFull 整个 xdb 读入内存，最快，内存占用≈文件大小。
-	CacheFull CachePolicy = CachePolicy(service.BufferCache)
+	CacheNone CachePolicy = iota
+	CacheVectorIndex
+	CacheFull
 )
 
 type config struct {
-	v4Policy     CachePolicy
-	v6Policy     CachePolicy
-	searchers    int
 	layout       Layout
 	cacheEntries int
 }
@@ -35,45 +35,28 @@ type config struct {
 // Option 是 Open 的可选项。
 type Option func(*config)
 
-// WithCachePolicy 同时设置 v4/v6 缓存策略。
-func WithCachePolicy(p CachePolicy) Option {
-	return func(c *config) { c.v4Policy, c.v6Policy = p, p }
-}
+func WithCachePolicy(CachePolicy) Option   { return func(*config) {} }
+func WithV4CachePolicy(CachePolicy) Option { return func(*config) {} }
+func WithV6CachePolicy(CachePolicy) Option { return func(*config) {} }
+func WithSearchers(int) Option             { return func(*config) {} }
 
-// WithV4CachePolicy 只设置 v4 缓存策略。
-func WithV4CachePolicy(p CachePolicy) Option {
-	return func(c *config) { c.v4Policy = p }
-}
+// WithLayout 显式指定 region 字段布局，跳过自动推断。
+func WithLayout(l Layout) Option { return func(c *config) { c.layout = l } }
 
-// WithV6CachePolicy 只设置 v6 缓存策略。
-func WithV6CachePolicy(p CachePolicy) Option {
-	return func(c *config) { c.v6Policy = p }
-}
-
-// WithSearchers 设置查询器池大小（CacheFull 下无效）。
-func WithSearchers(n int) Option {
+// WithLRU 开启结果缓存（总条数，内部按 256 分片均摊）。
+func WithLRU(entries int) Option {
 	return func(c *config) {
-		if n > 0 {
-			c.searchers = n
+		if entries > 0 {
+			c.cacheEntries = entries
 		}
 	}
 }
 
-// WithLayout 显式指定 region 字段布局，跳过自动推断。
-func WithLayout(l Layout) Option {
-	return func(c *config) { c.layout = l }
-}
-
-// WithLRU 开启结果缓存（条数）。
-func WithLRU(entries int) Option {
-	return func(c *config) { c.cacheEntries = entries }
-}
-
-// DB 是并发安全的查询句柄。
+// DB 是并发安全的只读查询句柄。
 type DB struct {
-	svc    *service.Ip2Region
+	v4, v6 searcher
 	layout Layout
-	cache  *lruCache
+	cache  *Cache
 }
 
 // Open 打开 v4 / v6 的 xdb；任一参数传空串表示禁用该版本。
@@ -82,40 +65,35 @@ func Open(v4Path, v6Path string, opts ...Option) (*DB, error) {
 		return nil, errors.New("ipgeo: at least one of v4Path / v6Path is required")
 	}
 
-	cfg := &config{v4Policy: CacheVectorIndex, v6Policy: CacheVectorIndex, searchers: 8}
+	cfg := &config{}
 	for _, opt := range opts {
 		opt(cfg)
 	}
 
-	var (
-		v4, v6 *service.Config
-		err    error
-	)
+	db := &DB{layout: cfg.layout}
 
 	if v4Path != "" {
-		if v4, err = service.NewV4Config(int(cfg.v4Policy), v4Path, cfg.searchers); err != nil {
+		s, err := newSearcher(v4Path, true)
+		if err != nil {
 			return nil, fmt.Errorf("ipgeo: open ipv4 xdb %q: %w", v4Path, err)
 		}
+		db.v4 = s
 	}
 	if v6Path != "" {
-		if v6, err = service.NewV6Config(int(cfg.v6Policy), v6Path, cfg.searchers); err != nil {
+		s, err := newSearcher(v6Path, false)
+		if err != nil {
+			db.Close()
 			return nil, fmt.Errorf("ipgeo: open ipv6 xdb %q: %w", v6Path, err)
 		}
+		db.v6 = s
 	}
-
-	svc, err := service.NewIp2Region(v4, v6)
-	if err != nil {
-		return nil, fmt.Errorf("ipgeo: create service: %w", err)
-	}
-
-	db := &DB{svc: svc, layout: cfg.layout}
 	if cfg.cacheEntries > 0 {
-		db.cache = newLRU(cfg.cacheEntries)
+		db.cache = NewCache(cfg.cacheEntries)
 	}
 	return db, nil
 }
 
-// MustOpen 是 Open 的 panic 版本，方便初始化。
+// MustOpen 是 Open 的 panic 版本。
 func MustOpen(v4Path, v6Path string, opts ...Option) *DB {
 	db, err := Open(v4Path, v6Path, opts...)
 	if err != nil {
@@ -124,82 +102,98 @@ func MustOpen(v4Path, v6Path string, opts ...Option) *DB {
 	return db
 }
 
-// Close 释放查询器池，等待归还最多 10 秒。
-func (db *DB) Close() { db.svc.Close() }
+// Close 释放 mmap 映射；调用后不得再查询。
+func (db *DB) Close() {
+	if db.v4 != nil {
+		db.v4.close()
+		db.v4 = nil
+	}
+	if db.v6 != nil {
+		db.v6.close()
+		db.v6 = nil
+	}
+}
 
 // Lookup 传入字符串 IP，返回结构化结果。
 func (db *DB) Lookup(ip string) (*Info, error) {
-	parsed := net.ParseIP(strings.TrimSpace(ip))
-	if parsed == nil {
-		return nil, fmt.Errorf("ipgeo: invalid ip address %q", ip)
+	a, err := netip.ParseAddr(strings.TrimSpace(ip))
+	if err != nil {
+		return nil, fmt.Errorf("%w: %q", ErrInvalidIP, ip)
 	}
-	return db.LookupIP(parsed)
+	return db.LookupAddr(a)
 }
 
 // LookupIP 传入 net.IP，返回结构化结果。
 func (db *DB) LookupIP(ip net.IP) (*Info, error) {
-	if len(ip) == 0 {
-		return nil, errors.New("ipgeo: empty ip")
+	a, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrInvalidIP, ip.String())
 	}
+	return db.LookupAddr(a)
+}
 
-	// 统一 ::ffff:1.2.3.4 这类 IPv4-mapped IPv6
-	var (
-		ver Version
-		key string
-	)
-	if v4 := ip.To4(); v4 != nil {
-		ver, key = IPv4, v4.String()
-	} else if v6 := ip.To16(); v6 != nil {
-		ver, key = IPv6, v6.String()
-	} else {
-		return nil, fmt.Errorf("ipgeo: invalid ip address %q", ip.String())
+// LookupAddr 是零分配入口，推荐在热路径使用。
+func (db *DB) LookupAddr(a netip.Addr) (*Info, error) {
+	a = a.Unmap() // ::ffff:1.2.3.4 -> 1.2.3.4
+	if !a.IsValid() {
+		return nil, ErrInvalidIP
 	}
 
 	if db.cache != nil {
-		if info, ok := db.cache.get(key); ok {
+		if info, ok := db.cache.Get(a); ok {
 			return info, nil
 		}
 	}
 
-	// 私有/保留地址直接短路，避免无意义的库查询
-	if isReserved(ip) {
-		info := &Info{IP: key, Version: ver, IsPrivate: true}
-		db.store(key, info)
+	// 私有 / 保留地址直接短路
+	if isReservedAddr(a) {
+		info := &Info{Addr: a, IsPrivate: true, Version: versionOf(a)}
+		info.IP = info.Addr.String()
 		return info, nil
 	}
 
-	region, err := db.svc.Search(key)
-	if err != nil {
-		return nil, fmt.Errorf("ipgeo: search %s: %w", key, err)
+	var (
+		raw []byte
+		ok  bool
+	)
+	if a.Is4() {
+		if db.v4 == nil {
+			return nil, ErrNotFound
+		}
+		b := a.As4()
+		raw, ok = db.v4.search4(be32(b[:]))
+	} else {
+		if db.v6 == nil {
+			return nil, ErrNotFound
+		}
+		raw, ok = db.v6.search16(a.As16())
 	}
-	if region == "" {
+	if !ok || len(raw) == 0 {
 		return nil, ErrNotFound
 	}
 
-	layout := db.layout
-	if layout == nil {
-		layout = autoLayout(region)
+	info := newInfo(a, raw, db.layout)
+	if db.cache != nil {
+		db.cache.Put(a, info)
 	}
-
-	info := parseRegion(region, layout)
-	info.IP = key
-	info.Version = ver
-	db.store(key, info)
 	return info, nil
 }
 
-func (db *DB) store(key string, info *Info) {
-	if db.cache != nil {
-		db.cache.put(key, info)
+func versionOf(a netip.Addr) Version {
+	if a.Is4() {
+		return IPv4
 	}
+	return IPv6
 }
 
-func isReserved(ip net.IP) bool {
-	return ip.IsPrivate() ||
-		ip.IsLoopback() ||
-		ip.IsUnspecified() ||
-		ip.IsMulticast() ||
-		ip.IsLinkLocalUnicast() ||
-		ip.IsLinkLocalMulticast() ||
-		ip.IsInterfaceLocalMulticast()
+func isReservedAddr(a netip.Addr) bool {
+	return a.IsPrivate() ||
+		a.IsLoopback() ||
+		a.IsUnspecified() ||
+		a.IsMulticast() ||
+		a.IsLinkLocalUnicast() ||
+		a.IsLinkLocalMulticast() ||
+		a.IsInterfaceLocalMulticast()
 }
+
+var _ = context.Background

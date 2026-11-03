@@ -1,57 +1,87 @@
 package ipgeo
 
 import (
-	"container/list"
+	"encoding/binary"
+	"net/netip"
 	"sync"
 )
 
-type lruEntry struct {
-	key  string
-	info *Info
+const cacheShards = 256
+
+// cacheShard 是独立加锁的分片：命中走 RLock，不阻塞其他 CPU。
+type cacheShard struct {
+	mu   sync.RWMutex
+	m    map[netip.Addr]*Info
+	ring []netip.Addr // FIFO 淘汰顺序
+	pos  int
 }
 
-// lruCache 是带互斥锁的简单 LRU，用于挡住热点 IP 的重复查询。
-type lruCache struct {
-	mu    sync.Mutex
-	size  int
-	ll    *list.List
-	items map[string]*list.Element
+func (s *cacheShard) get(a netip.Addr) (*Info, bool) {
+	s.mu.RLock()
+	v, ok := s.m[a]
+	s.mu.RUnlock()
+	return v, ok
 }
 
-func newLRU(size int) *lruCache {
-	return &lruCache{
-		size:  size,
-		ll:    list.New(),
-		items: make(map[string]*list.Element, size),
-	}
-}
-
-func (c *lruCache) get(key string) (*Info, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if el, ok := c.items[key]; ok {
-		c.ll.MoveToFront(el)
-		return el.Value.(*lruEntry).info, true
-	}
-	return nil, false
-}
-
-func (c *lruCache) put(key string, info *Info) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if el, ok := c.items[key]; ok {
-		el.Value.(*lruEntry).info = info
-		c.ll.MoveToFront(el)
+func (s *cacheShard) put(a netip.Addr, v *Info) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.m[a]; ok {
 		return
 	}
-	el := c.ll.PushFront(&lruEntry{key: key, info: info})
-	c.items[key] = el
-	for c.ll.Len() > c.size {
-		last := c.ll.Back()
-		if last == nil {
-			return
-		}
-		c.ll.Remove(last)
-		delete(c.items, last.Value.(*lruEntry).key)
+	if len(s.ring) < cap(s.ring) {
+		s.ring = append(s.ring, a)
+		s.m[a] = v
+		return
 	}
+	if len(s.ring) == 0 {
+		return
+	}
+	delete(s.m, s.ring[s.pos])
+	s.ring[s.pos] = a
+	s.m[a] = v
+	s.pos++
+	if s.pos == len(s.ring) {
+		s.pos = 0
+	}
+}
+
+// Cache 是按 IP 分片的结果缓存，容量均摊到 256 片。
+type Cache struct {
+	shards [cacheShards]cacheShard
+}
+
+func NewCache(capacity int) *Cache {
+	if capacity < cacheShards {
+		capacity = cacheShards
+	}
+	per := capacity / cacheShards
+	c := new(Cache)
+	for i := range c.shards {
+		c.shards[i].m = make(map[netip.Addr]*Info, per)
+		c.shards[i].ring = make([]netip.Addr, 0, per)
+	}
+	return c
+}
+
+func (c *Cache) Get(a netip.Addr) (*Info, bool) {
+	return c.shards[shardOf(a)&(cacheShards-1)].get(a)
+}
+
+func (c *Cache) Put(a netip.Addr, v *Info) {
+	c.shards[shardOf(a)&(cacheShards-1)].put(a, v)
+}
+
+func shardOf(a netip.Addr) uint32 {
+	var h uint64
+	if a.Is4() {
+		b := a.As4()
+		h = uint64(binary.BigEndian.Uint32(b[:]))
+	} else {
+		b := a.As16()
+		h = binary.LittleEndian.Uint64(b[:]) ^ binary.LittleEndian.Uint64(b[8:])
+	}
+	h *= 0x9E3779B97F4A7C15
+	h ^= h >> 29
+	return uint32(h >> 32)
 }

@@ -1,6 +1,9 @@
 package ipgeo
 
-import "strings"
+import (
+	"net/netip"
+	"strings"
+)
 
 // Version 表示命中的 IP 版本。
 type Version uint8
@@ -11,23 +14,22 @@ const (
 )
 
 // Info 是一次查询的结构化结果。
-// 字段与 fa1seut0pia/ip2region-xdb 的输出（洲|国家|省|市|区县|ISP|网络类型）对齐。
 type Info struct {
-	IP          string  `json:"ip"`
-	Version     Version `json:"version"`
-	Continent   string  `json:"continent,omitempty"`    // 洲：亚洲
-	Country     string  `json:"country,omitempty"`      // 国家：中国
-	Province    string  `json:"province,omitempty"`     // 省：浙江省
-	City        string  `json:"city,omitempty"`         // 市：杭州市
-	District    string  `json:"district,omitempty"`     // 区县：西湖区
-	ISP         string  `json:"isp,omitempty"`          // 运营商：电信
-	NetworkType string  `json:"network_type,omitempty"` // 宽带/基站/专线/IDC
-	ISOCode     string  `json:"iso_code,omitempty"`     // ISO 3166-1 alpha-2：CN
-	IsPrivate   bool    `json:"is_private,omitempty"`   // 私有/保留地址
-	Raw         string  `json:"raw,omitempty"`          // 原始 region 串
+	IP          string     `json:"ip"`
+	Addr        netip.Addr `json:"-"` // 零分配的强类型入口
+	Version     Version    `json:"version"`
+	Continent   string     `json:"continent,omitempty"`
+	Country     string     `json:"country,omitempty"`
+	Province    string     `json:"province,omitempty"`
+	City        string     `json:"city,omitempty"`
+	District    string     `json:"district,omitempty"`
+	ISP         string     `json:"isp,omitempty"`
+	NetworkType string     `json:"network_type,omitempty"`
+	ISOCode     string     `json:"iso_code,omitempty"`
+	IsPrivate   bool       `json:"is_private,omitempty"`
+	Raw         string     `json:"raw,omitempty"`
 }
 
-// String 返回非空字段的紧凑表示，便于打日志。
 func (i *Info) String() string {
 	parts := make([]string, 0, 5)
 	for _, s := range []string{i.Country, i.Province, i.City, i.District, i.ISP} {
@@ -38,7 +40,6 @@ func (i *Info) String() string {
 	return strings.Join(parts, "|")
 }
 
-// Fields 按“国家|省|城市|ISP|ISO”返回 5 个字段。
 func (i *Info) Fields() [5]string {
 	return [5]string{i.Country, i.Province, i.City, i.ISP, i.ISOCode}
 }
@@ -57,22 +58,15 @@ const (
 	FieldISOCode
 )
 
-// Layout 描述 region 按 "|" 拆分后，每个位置对应的逻辑字段。
+// Layout 描述 region 按 "|" 拆分后每个位置对应的逻辑字段。
 type Layout []Field
 
 var (
-	// LayoutAggregated：fa1seut0pia/ip2region-xdb 默认产物（7 段）
-	// 洲|国家|省份|城市|区县|ISP|网络类型
-	LayoutAggregated = Layout{FieldContinent, FieldCountry, FieldProvince, FieldCity, FieldDistrict, FieldISP, FieldNetworkType}
-
-	// LayoutAggregatedISO：在聚合产物末尾追加 ISO 国家码（8 段）
+	LayoutAggregated    = Layout{FieldContinent, FieldCountry, FieldProvince, FieldCity, FieldDistrict, FieldISP, FieldNetworkType}
 	LayoutAggregatedISO = Layout{FieldContinent, FieldCountry, FieldProvince, FieldCity, FieldDistrict, FieldISP, FieldNetworkType, FieldISOCode}
-
-	// LayoutOfficial：ip2region 官方免费数据（5 段）国家|省|市|ISP|ISO
-	LayoutOfficial = Layout{FieldCountry, FieldProvince, FieldCity, FieldISP, FieldISOCode}
+	LayoutOfficial      = Layout{FieldCountry, FieldProvince, FieldCity, FieldISP, FieldISOCode}
 )
 
-// autoLayout 按段数猜布局；不确定时按聚合格式对齐。
 func autoLayout(region string) Layout {
 	switch n := strings.Count(region, "|") + 1; {
 	case n == 5:
@@ -82,43 +76,61 @@ func autoLayout(region string) Layout {
 	case n == 8:
 		return LayoutAggregatedISO
 	case n > 8:
-		return LayoutAggregatedISO // 多出的字段忽略
-	default: // 6 段等非常规情况：按聚合格式截断
+		return LayoutAggregatedISO
+	default:
 		return LayoutAggregated[:n]
 	}
 }
 
-func parseRegion(region string, layout Layout) *Info {
-	parts := strings.Split(region, "|")
-	info := &Info{Raw: region}
-	for i, f := range layout {
-		if i >= len(parts) {
-			break
-		}
-		v := normalizeField(parts[i])
-		switch f {
-		case FieldContinent:
-			info.Continent = v
-		case FieldCountry:
-			info.Country = v
-		case FieldProvince:
-			info.Province = v
-		case FieldCity:
-			info.City = v
-		case FieldDistrict:
-			info.District = v
-		case FieldISP:
-			info.ISP = v
-		case FieldNetworkType:
-			info.NetworkType = v
-		case FieldISOCode:
-			info.ISOCode = strings.ToUpper(v)
+// newInfo 单次扫描解析 region：只分配 1 个字符串，字段全部复用其子串。
+func newInfo(a netip.Addr, raw []byte, layout Layout) *Info {
+	s := string(raw)
+
+	info := &Info{
+		Addr:    a,
+		Version: versionOf(a),
+		Raw:     s,
+	}
+	var buf [48]byte
+	info.IP = string(a.AppendTo(buf[:0]))
+
+	if layout == nil {
+		layout = autoLayout(s)
+	}
+
+	var start, n int
+	for i := 0; i <= len(s) && n < len(layout); i++ {
+		if i == len(s) || s[i] == '|' {
+			setField(info, layout[n], normalizeField(s[start:i]))
+			n++
+			start = i + 1
 		}
 	}
 	return info
 }
 
-// normalizeField 清理占位值：官方库里空 ISP/国家码常写成 "0"。
+func setField(info *Info, f Field, v string) {
+	switch f {
+	case FieldContinent:
+		info.Continent = v
+	case FieldCountry:
+		info.Country = v
+	case FieldProvince:
+		info.Province = v
+	case FieldCity:
+		info.City = v
+	case FieldDistrict:
+		info.District = v
+	case FieldISP:
+		info.ISP = v
+	case FieldNetworkType:
+		info.NetworkType = v
+	case FieldISOCode:
+		info.ISOCode = strings.ToUpper(v)
+	}
+}
+
+// normalizeField 清理占位值：官方库里空 ISP / 国家码常写成 "0"。
 func normalizeField(s string) string {
 	s = strings.TrimSpace(s)
 	if s == "0" || s == "-" {
