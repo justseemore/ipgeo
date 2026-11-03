@@ -1,0 +1,9 @@
+# xdb 数据文件体积较大，不入库
+data/*.xdb
+data/*.txt
+# 构建产物
+/bin/
+/dist/
+*.test
+*.out
+.DS_Store
