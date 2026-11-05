@@ -30,6 +30,7 @@ const (
 type config struct {
 	layout       Layout
 	cacheEntries int
+	preload      bool
 }
 
 // Option 是 Open 的可选项。
@@ -39,6 +40,12 @@ func WithCachePolicy(CachePolicy) Option   { return func(*config) {} }
 func WithV4CachePolicy(CachePolicy) Option { return func(*config) {} }
 func WithV6CachePolicy(CachePolicy) Option { return func(*config) {} }
 func WithSearchers(int) Option             { return func(*config) {} }
+
+// WithPreload 把 xdb 整个读进堆内存，而不是 mmap。
+//
+// 适合库文件固定、实例内存可控的部署：省掉运行期缺页抖动，代价是 RSS ≈ 文件大小
+// （v4 / v6 分别计算，多个实例则各自一份）。默认 false，即 mmap + MADV_RANDOM。
+func WithPreload(preload bool) Option { return func(c *config) { c.preload = preload } }
 
 // WithLayout 显式指定 region 字段布局，跳过自动推断。
 func WithLayout(l Layout) Option { return func(c *config) { c.layout = l } }
@@ -73,14 +80,14 @@ func Open(v4Path, v6Path string, opts ...Option) (*DB, error) {
 	db := &DB{layout: cfg.layout}
 
 	if v4Path != "" {
-		s, err := newSearcher(v4Path, true)
+		s, err := newSearcher(v4Path, true, cfg.preload)
 		if err != nil {
 			return nil, fmt.Errorf("ipgeo: open ipv4 xdb %q: %w", v4Path, err)
 		}
 		db.v4 = s
 	}
 	if v6Path != "" {
-		s, err := newSearcher(v6Path, false)
+		s, err := newSearcher(v6Path, false, cfg.preload)
 		if err != nil {
 			db.Close()
 			return nil, fmt.Errorf("ipgeo: open ipv6 xdb %q: %w", v6Path, err)

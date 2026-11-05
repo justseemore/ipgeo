@@ -11,8 +11,8 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// newSearcher 以只读方式 mmap 整个 xdb，之后 fd 立即关闭。
-func newSearcher(path string, wantV4 bool) (searcher, error) {
+// newSearcher 打开 xdb：默认 mmap（关掉顺序预读），preload 时整文件读进堆。
+func newSearcher(path string, wantV4, preload bool) (searcher, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -40,6 +40,16 @@ func newSearcher(path string, wantV4 bool) (searcher, error) {
 	}
 	if fi.Size() < headerInfoLength {
 		return nil, errors.New("xdb file too small")
+	}
+
+	// 预加载：读进堆，不走 mmap。memSearcher.close() 的 unmap 为 nil，
+	// 只清掉切片引用，内存交给 GC。
+	if preload {
+		data, err := os.ReadFile(path) // 独立 fd，不影响上面 f 的偏移
+		if err != nil {
+			return nil, fmt.Errorf("preload xdb: %w", err)
+		}
+		return &memSearcher{data: data}, nil
 	}
 
 	data, err := unix.Mmap(int(f.Fd()), 0, int(fi.Size()), unix.PROT_READ, unix.MAP_SHARED)
