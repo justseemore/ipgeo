@@ -1,0 +1,11 @@
+# 别把 122MB 的 xdb 和 git 历史塞进 build context
+.git
+.github
+.gitignore
+bin/
+data/
+*.md
+docker-compose.yml
+Dockerfile.*
+.dockerignore
+.DS_Store

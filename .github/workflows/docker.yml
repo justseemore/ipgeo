@@ -1,0 +1,132 @@
+name: docker
+
+# 触发与行为：
+#   push main / tag v*  → 跑测试 + 多架构构建 + 推送 GHCR
+#   pull_request        → 只跑测试 + 单架构构建验证，不推送
+#   schedule            → 每天重建一次，把最新的 xdb 数据烤进镜像
+#   workflow_dispatch   → Actions 页面手动触发
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "0 5 * * *" # 05:00 UTC；上游数据基本日更
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write # 推 ghcr.io 必需
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # 想换镜像名改这一行，例如 ghcr.io/${{ github.repository_owner }}/ipgeo-server
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  test:
+    name: test & vet
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod # 直接读 go 1.26.0
+          check-latest: true
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l ./cmd)"
+          if [ -n "$unformatted" ]; then
+            echo "以下文件需要 gofmt，执行 'gofmt -w ./cmd' 修复："
+            echo "$unformatted"
+            echo "----- diff -----"
+            gofmt -d $unformatted
+            exit 1
+          fi
+
+      - name: vet
+        run: go vet ./...
+
+      # 未设置 IPGEO_V4_XDB 时库的测试会 t.Skip，等价于编译 + 静态检查
+      - name: test
+        run: go test -race ./...
+
+  docker:
+    name: build & push
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      # 让 xdb 下载层每天失效一次；同一天内多次构建仍命中缓存
+      - name: data version
+        id: date
+        run: echo "value=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+
+      # Dockerfile 已用 BUILDPLATFORM + 交叉编译，arm64 不靠 QEMU；
+      # 保留这一步只为将来出现「需在目标架构执行」的指令时不用改 workflow。
+      - uses: docker/setup-qemu-action@v3
+        if: github.event_name != 'pull_request'
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 计算镜像标签
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=short
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main' }}
+            type=raw,value=data-${{ steps.date.outputs.value }},enable=${{ github.ref == 'refs/heads/main' }}
+          labels: |
+            org.opencontainers.image.title=ipgeo-server
+            org.opencontainers.image.description=IP geolocation HTTP service backed by ip2region xdb
+
+      - name: 构建并推送
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ github.event_name == 'pull_request' && 'linux/amd64' || 'linux/amd64,linux/arm64' }}
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ github.ref_name }}
+            DATA_VERSION=${{ steps.date.outputs.value }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true
+
+      - name: 写入 job 摘要
+        if: github.event_name != 'pull_request'
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          {
+            echo "### 镜像已推送"
+            echo ""
+            echo '```'
+            printf '%s\n' "$TAGS"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
